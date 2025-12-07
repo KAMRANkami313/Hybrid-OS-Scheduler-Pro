@@ -5,7 +5,6 @@ import plotly.express as px
 import time
 import io
 import random
-# --- NEW IMPORT ---
 from scheduler_wrapper import solve_scheduling, SchedulerLoadError
 
 # --- PAGE CONFIG ---
@@ -50,10 +49,20 @@ if 'current_step_time' not in st.session_state: st.session_state.current_step_ti
 
 # --- HELPER FUNCTIONS ---
 
+# --- UPDATED PID GENERATION LOGIC ---
 def generate_random_processes(count, max_at, min_bt, max_bt, max_prio):
     new_procs = []
-    current_pids = [int(str(p['pid']).replace('P', '')) for p in st.session_state.processes if str(p['pid']).startswith('P')]
-    next_pid_num = max(current_pids) + 1 if current_pids else 1
+    
+    current_pid_nums = []
+    for p in st.session_state.processes:
+        try:
+            pid_str = str(p['pid']).upper().strip()
+            if pid_str.startswith('P'):
+                current_pid_nums.append(int(pid_str[1:]))
+        except ValueError:
+            pass
+            
+    next_pid_num = max(current_pid_nums) + 1 if current_pid_nums else 1
     
     for i in range(count):
         new_procs.append({
@@ -63,6 +72,8 @@ def generate_random_processes(count, max_at, min_bt, max_bt, max_prio):
             "priority": random.randint(1, max_prio)
         })
     return new_procs
+# --- END UPDATED PID GENERATION LOGIC ---
+
 
 def create_gantt_chart(gantt_data, total_duration, color_map, height=200):
     fig = go.Figure()
@@ -107,19 +118,22 @@ def display_stats_table(df):
     avg_tat = df['tat'].mean()
     avg_wt = df['wt'].mean()
     avg_bt = df['bt'].mean()
+    avg_rt = df['rt'].mean()
 
     disp_df = df.copy()
     avg_row = pd.DataFrame([{
         "pid": "AVERAGE", "at": 0, "bt": avg_bt, "priority": 0, 
-        "ct": 0, "tat": avg_tat, "wt": avg_wt, "status": "-"
+        "ct": 0, "tat": avg_tat, "wt": avg_wt, "rt": avg_rt, "status": "-"
     }])
     disp_df = pd.concat([disp_df, avg_row], ignore_index=True)
 
     st.dataframe(
         disp_df.style.format({
-            "bt": "{:.1f}", "tat": "{:.2f}", "wt": "{:.2f}", "at": "{:.0f}", "ct": "{:.0f}"
-        }).background_gradient(subset=['tat', 'wt'], cmap="Reds"), 
-        use_container_width=True
+            "bt": "{:.1f}", "tat": "{:.2f}", "wt": "{:.2f}", "rt": "{:.2f}", "at": "{:.0f}", "ct": "{:.0f}"
+        }).background_gradient(subset=['tat', 'wt', 'rt'], cmap="Reds"), 
+        use_container_width=True,
+        # Try to hide the confusing Pandas index (0, 1, 2, 3...)
+        hide_index=True 
     )
 
 def run_scheduler_logic(algo, quant):
@@ -128,10 +142,9 @@ def run_scheduler_logic(algo, quant):
         return False
     
     try:
-        # --- Catch the DLL loading error here ---
         final_df, timeline = solve_scheduling(st.session_state.processes, algo, quant)
     except SchedulerLoadError as e:
-        st.error(str(e)) # Display the specific DLL error to the user
+        st.error(str(e))
         return False
         
     total_time = int(final_df['ct'].max()) if not final_df.empty else 0
@@ -148,13 +161,20 @@ st.sidebar.header("⚙️ Configuration")
 st.sidebar.subheader("📝 Manual Process Entry")
 with st.sidebar.form("add_manual"):
     c1, c2 = st.columns(2)
-    pid = c1.text_input("ID", value=f"P{len(st.session_state.processes)+1}")
+    # Hint for next available PID
+    try:
+        pids_in_use = [int(str(p['pid']).replace('P', '')) for p in st.session_state.processes if str(p['pid']).startswith('P')]
+        next_manual_pid = max(pids_in_use) + 1 if pids_in_use else 1
+    except:
+        next_manual_pid = len(st.session_state.processes) + 1
+        
+    pid = c1.text_input("ID", value=f"P{next_manual_pid}")
     at = c2.number_input("Arrival", 0, value=0)
     bt = c1.number_input("Burst", 1, value=5)
     prio = c2.number_input("Priority", 1, value=1)
     if st.form_submit_button("Add Process"):
         st.session_state.processes.append({"pid": pid, "at": int(at), "bt": int(bt), "priority": int(prio)})
-        st.rerun() # Use st.rerun()
+        st.rerun()
 
 # --- Process Generation Tab 2 ---
 st.sidebar.subheader("🎲 Random Process Generator")
@@ -168,34 +188,23 @@ with st.sidebar.form("add_random"):
     if st.form_submit_button(f"Generate {N} Processes"):
         new_procs = generate_random_processes(N, max_at, min_bt, max_bt, max_prio)
         st.session_state.processes.extend(new_procs)
-        st.rerun() # Use st.rerun()
+        st.rerun()
 
-# --- Process File Handling ---
+# --- Process File Handling (Fixed against infinite rerun loop) ---
 st.sidebar.subheader("📂 Data Utilities")
 upload_file = st.sidebar.file_uploader("Upload CSV Process List", type=["csv"], key="csv_uploader")
-
 if upload_file is not None:
-    # We process the upload ONLY if the file handle itself is present AND if we haven't processed it this run
     try:
         uploaded_df = pd.read_csv(upload_file)
-        # Ensure column names match expected keys
         required_cols = ['pid', 'at', 'bt', 'priority']
         if all(col in uploaded_df.columns for col in required_cols):
             st.session_state.processes = uploaded_df[required_cols].astype({'at': int, 'bt': int, 'priority': int}).to_dict('records')
-            
-            # The page will rerun automatically because the session state changed,
-            # but we avoid an explicit st.rerun() which can loop with uploaders.
-            st.sidebar.success("Processes loaded successfully! The page will refresh shortly.")
-            
-            # Note: Because we removed st.rerun(), the file handle persists across script reruns.
-            # However, since we rely on the implicit Streamlit flow, this should prevent the lockup.
-            # If the lockup persists, you might need to try wrapping this entire section in st.sidebar.form()
-            # to clear the upload state on form submission, but let's try this first.
-
+            st.sidebar.success("Processes loaded successfully!")
         else:
             st.sidebar.error(f"CSV must contain columns: {', '.join(required_cols)}")
     except Exception as e:
         st.sidebar.error(f"Error reading file: {e}")
+
 # Download button for current processes
 if st.session_state.processes:
     download_df = pd.DataFrame(st.session_state.processes)
@@ -213,7 +222,7 @@ if st.sidebar.button("Reset All Data", help="Clears all processes and simulation
     st.session_state.processes = []
     st.session_state.last_run_df = None
     st.session_state.step_mode_active = False
-    st.rerun() # Use st.rerun()
+    st.rerun()
 
 # --- MAIN APP ---
 st.title("⚡ Hybrid OS Scheduler Pro")
@@ -221,6 +230,7 @@ st.caption("C++ Logic Engine | Python Analysis Suite")
 
 if st.session_state.processes:
     st.markdown("#### Current Process List")
+    # Display the input data using PID as index
     st.dataframe(pd.DataFrame(st.session_state.processes).set_index('pid'), use_container_width=True)
 else:
     st.info("Add processes using the sidebar (manual or random generation) to begin.")
@@ -273,7 +283,6 @@ with tab1:
         stats_placeholder = st.empty()
 
         def render_queue(t, df, curr_task):
-            # We approximate the queue by checking which processes have arrived, are not complete, and are not currently running.
             q_list = [p['pid'] for i,p in df.iterrows() if p['at']<=t and p['ct']>t and p['pid']!=curr_task]
             q_str = ' ➡️ '.join(q_list) if q_list else "Empty"
             html = f"""
@@ -289,7 +298,6 @@ with tab1:
             timeline = st.session_state.last_run_tl
             total_time = st.session_state.last_total_time
             
-            # Check if simulation is active (animation or mid-step)
             is_active = anim_clicked or (st.session_state.step_mode_active and st.session_state.current_step_time <= total_time)
             
             if is_active:
@@ -323,7 +331,7 @@ with tab1:
                         time.sleep(speed)
                     
                     if st.session_state.step_mode_active:
-                        break # Exit loop after one step
+                        break
 
                 # Step-by-Step Controls
                 if st.session_state.step_mode_active:
@@ -331,11 +339,11 @@ with tab1:
                     if bc1.button("◀ Previous Step"):
                         if st.session_state.current_step_time > 0:
                             st.session_state.current_step_time -= 1
-                            st.rerun() # Use st.rerun()
+                            st.rerun()
                     if bc2.button("Next Step ▶"):
                         if st.session_state.current_step_time < total_time:
                             st.session_state.current_step_time += 1
-                            st.rerun() # Use st.rerun()
+                            st.rerun()
 
                 # Display final stats if simulation is complete
                 if st.session_state.current_step_time >= total_time or anim_clicked:
@@ -375,24 +383,22 @@ with tab2:
                 df2, tl2 = solve_scheduling(st.session_state.processes, algoB, qB)
             except SchedulerLoadError as e:
                 st.error(str(e))
-                # Skip visualization if DLL failed
                 st.stop()
 
             max_t = max(df1['ct'].max(), df2['ct'].max())
             
             st.markdown("### 📈 Performance Summary")
             
-            # New Comparison Bar Chart
             comp_data = pd.DataFrame({
-                'Algorithm': [algoA, algoA, algoB, algoB],
-                'Metric': ['Avg TAT', 'Avg WT', 'Avg TAT', 'Avg WT'],
-                'Value': [df1['tat'].mean(), df1['wt'].mean(), df2['tat'].mean(), df2['wt'].mean()]
+                'Algorithm': [algoA, algoA, algoA, algoB, algoB, algoB],
+                'Metric': ['Avg TAT', 'Avg WT', 'Avg RT', 'Avg TAT', 'Avg WT', 'Avg RT'],
+                'Value': [df1['tat'].mean(), df1['wt'].mean(), df1['rt'].mean(), df2['tat'].mean(), df2['wt'].mean(), df2['rt'].mean()]
             })
             fig_comp = px.bar(
                 comp_data, x="Algorithm", y="Value", color="Metric", 
                 barmode="group",
                 title="Average Performance Metrics Comparison",
-                color_discrete_map={'Avg TAT': '#FF6B6B', 'Avg WT': '#4ECDC4'}
+                color_discrete_map={'Avg TAT': '#FF6B6B', 'Avg WT': '#4ECDC4', 'Avg RT': '#45B7D1'}
             )
             st.plotly_chart(fig_comp, use_container_width=True)
 
@@ -428,10 +434,13 @@ with tab3:
         context_switches = len([s for s in tl if s['Task'] != "Idle"]) - len(df)
         if context_switches < 0: context_switches = 0
         
-        m1, m2, m3 = st.columns(3)
+        avg_rt = df['rt'].mean()
+        
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("CPU Utilization", f"{round(utilization, 1)}%")
         m2.metric("Throughput", f"{round(throughput, 2)} jobs/sec")
         m3.metric("Context Switches", context_switches)
+        m4.metric("Avg Response Time", f"{round(avg_rt, 2)}s")
 
         c1, c2 = st.columns([1, 2])
         
@@ -446,16 +455,17 @@ with tab3:
             fig_gauge.update_layout(height=250, margin=dict(l=20,r=20,t=30,b=20))
             st.plotly_chart(fig_gauge, use_container_width=True)
             
-        # 3.2 Time Composition Bar Chart (Wait vs Burst)
+        # 3.2 Time Composition Bar Chart (Burst, Wait, Response)
         with c2: 
             df_plot = df.copy()
             df_plot["Burst"] = df_plot["bt"]
             df_plot["Wait"] = df_plot["wt"]
+            df_plot["Response"] = df_plot["rt"]
             
             fig_bar = px.bar(
-                df_plot, x="pid", y=["Burst", "Wait"], 
-                title="Time Composition per Process (Burst vs. Wait)",
-                color_discrete_map={"Burst": "#FF6B6B", "Wait": "#D3D3D3"},
+                df_plot, x="pid", y=["Burst", "Wait", "Response"], 
+                title="Time Composition per Process (Burst vs. Wait vs. Response)",
+                color_discrete_map={"Burst": "#FF6B6B", "Wait": "#D3D3D3", "Response": "#45B7D1"},
                 labels={"value": "Time (s)", "variable": "State"}
             )
             fig_bar.update_layout(height=300, plot_bgcolor='white')
@@ -464,16 +474,31 @@ with tab3:
         st.markdown("---")
         st.subheader("🔍 Performance Trade-offs")
         
-        # 3.3 Scatter Plot: AT vs WT
-        fig_scatter = px.scatter(
-            df, x='at', y='wt', text='pid',
-            title='Waiting Time vs. Arrival Time (Identify Starvation)',
-            labels={'at': 'Arrival Time (s)', 'wt': 'Waiting Time (s)'}
-        )
-        fig_scatter.update_traces(textposition='top center')
-        fig_scatter.update_layout(plot_bgcolor='white')
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        c_plots1, c_plots2 = st.columns(2) 
 
-        # 3.4 Event Logs
+        # 3.3 Scatter Plot 1: AT vs WT (Identify Starvation/Delay)
+        with c_plots1:
+            fig_scatter_wt = px.scatter(
+                df, x='at', y='wt', text='pid',
+                title='Waiting Time vs. Arrival Time',
+                labels={'at': 'Arrival Time (s)', 'wt': 'Waiting Time (s)'}
+            )
+            fig_scatter_wt.update_traces(textposition='top center')
+            fig_scatter_wt.update_layout(plot_bgcolor='white')
+            st.plotly_chart(fig_scatter_wt, use_container_width=True)
+            
+        # 3.4 Scatter Plot 2: RT vs TAT (Relates responsiveness to throughput)
+        with c_plots2:
+            fig_scatter_rt = px.scatter(
+                df, x='rt', y='tat', text='pid',
+                title='Response Time vs. Turnaround Time',
+                labels={'rt': 'Response Time (s)', 'tat': 'Turnaround Time (s)'}
+            )
+            fig_scatter_rt.update_traces(textposition='top center')
+            fig_scatter_rt.update_layout(plot_bgcolor='white')
+            st.plotly_chart(fig_scatter_rt, use_container_width=True)
+
+
+        # 3.5 Event Logs
         logs = "\n".join(generate_event_log(tl))
         st.download_button("📜 Download Simulation Event Logs", logs, "events.txt", "text/plain")

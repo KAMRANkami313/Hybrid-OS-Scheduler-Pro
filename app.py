@@ -15,7 +15,7 @@ st.markdown("""
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
+  
     .block-container {padding-top: 1rem; padding-bottom: 3rem;}
     
     /* Metrics Styling */
@@ -49,7 +49,6 @@ if 'current_step_time' not in st.session_state: st.session_state.current_step_ti
 
 # --- HELPER FUNCTIONS ---
 
-# --- UPDATED PID GENERATION LOGIC ---
 def generate_random_processes(count, max_at, min_bt, max_bt, max_prio):
     new_procs = []
     
@@ -72,8 +71,6 @@ def generate_random_processes(count, max_at, min_bt, max_bt, max_prio):
             "priority": random.randint(1, max_prio)
         })
     return new_procs
-# --- END UPDATED PID GENERATION LOGIC ---
-
 
 def create_gantt_chart(gantt_data, total_duration, color_map, height=200):
     fig = go.Figure()
@@ -132,17 +129,17 @@ def display_stats_table(df):
             "bt": "{:.1f}", "tat": "{:.2f}", "wt": "{:.2f}", "rt": "{:.2f}", "at": "{:.0f}", "ct": "{:.0f}"
         }).background_gradient(subset=['tat', 'wt', 'rt'], cmap="Reds"), 
         use_container_width=True,
-        # Try to hide the confusing Pandas index (0, 1, 2, 3...)
         hide_index=True 
     )
 
-def run_scheduler_logic(algo, quant):
+def run_scheduler_logic(algo, quant, mlq_assignments=None):
     if not st.session_state.processes:
         st.error("Please add processes first.")
         return False
     
     try:
-        final_df, timeline = solve_scheduling(st.session_state.processes, algo, quant)
+        # Pass mlq_assignments to the wrapper
+        final_df, timeline = solve_scheduling(st.session_state.processes, algo, quant, mlq_assignments)
     except SchedulerLoadError as e:
         st.error(str(e))
         return False
@@ -190,7 +187,7 @@ with st.sidebar.form("add_random"):
         st.session_state.processes.extend(new_procs)
         st.rerun()
 
-# --- Process File Handling (Fixed against infinite rerun loop) ---
+# --- Process File Handling ---
 st.sidebar.subheader("📂 Data Utilities")
 upload_file = st.sidebar.file_uploader("Upload CSV Process List", type=["csv"], key="csv_uploader")
 if upload_file is not None:
@@ -230,7 +227,6 @@ st.caption("C++ Logic Engine | Python Analysis Suite")
 
 if st.session_state.processes:
     st.markdown("#### Current Process List")
-    # Display the input data using PID as index
     st.dataframe(pd.DataFrame(st.session_state.processes).set_index('pid'), use_container_width=True)
 else:
     st.info("Add processes using the sidebar (manual or random generation) to begin.")
@@ -250,9 +246,52 @@ with tab1:
     # --- SETTINGS ---
     with col_settings:
         st.subheader("Settings")
-        algo = st.selectbox("Algorithm", ["FCFS", "Round Robin", "SJF (Non-Preemptive)", "SRTF (Preemptive SJF)", "Priority (Non-Preemptive)", "Priority (Preemptive)"])
+        algo = st.selectbox("Algorithm", [
+            "FCFS", 
+            "Round Robin", 
+            "SJF (Non-Preemptive)", 
+            "SRTF (Preemptive SJF)", 
+            "Priority (Non-Preemptive)", 
+            "Priority (Preemptive)",
+            "MLFQ (Multi-Level Feedback Queue)", 
+            "MLQ (Multi-Level Queue)" # NEW ALGO
+        ])
+        
         quant = 2
-        if algo == "Round Robin": quant = st.number_input("Quantum", 1, 10, 2, key="q1")
+        mlq_assignments = {}
+        
+        if algo == "Round Robin": 
+            quant = st.number_input("Quantum", 1, 10, 2, key="q1")
+            
+        elif algo == "MLFQ (Multi-Level Feedback Queue)":
+            st.info("Q1=8 (RR), Q2=16 (RR), Q3=FCFS. Promotion threshold: 50s.")
+            quant = 0 
+            
+        elif algo == "MLQ (Multi-Level Queue)": 
+            st.subheader("MLQ Queue Assignment")
+            st.info("Q1: Priority (P) | Q2: RR (Q=10) | Q3: FCFS")
+            
+            queue_options = {1: "Q1 (Priority P)", 2: "Q2 (RR Q=10)", 3: "Q3 (FCFS)"}
+            
+            current_procs_df = pd.DataFrame(st.session_state.processes)
+            
+            for index, row in current_procs_df.iterrows():
+                pid = row['pid']
+                # Default to Q3 if not set
+                default_q = 3
+                
+                # Use the process PID in the key for uniqueness
+                assignment = st.selectbox(
+                    f"Assign {pid}", 
+                    options=queue_options.keys(), 
+                    format_func=lambda x: queue_options[x],
+                    index=list(queue_options.keys()).index(default_q),
+                    key=f"mlq_assign_{pid}"
+                )
+                mlq_assignments[pid] = assignment
+                
+            quant = 0 # Dummy value
+            
         speed = st.slider("Anim Speed", 0.05, 1.0, 0.2)
         
         st.markdown("---")
@@ -262,7 +301,7 @@ with tab1:
         step_clicked = st.button("👣 Step-by-Step Mode")
 
         if step_clicked:
-            if run_scheduler_logic(algo, quant):
+            if run_scheduler_logic(algo, quant, mlq_assignments):
                 st.session_state.step_mode_active = True
                 st.session_state.current_step_time = 0
             else:
@@ -270,7 +309,7 @@ with tab1:
 
         if anim_clicked:
             st.session_state.step_mode_active = False
-            run_scheduler_logic(algo, quant)
+            run_scheduler_logic(algo, quant, mlq_assignments)
 
     # --- VISUALS ---
     with col_visuals:
@@ -283,14 +322,44 @@ with tab1:
         stats_placeholder = st.empty()
 
         def render_queue(t, df, curr_task):
-            q_list = [p['pid'] for i,p in df.iterrows() if p['at']<=t and p['ct']>t and p['pid']!=curr_task]
-            q_str = ' ➡️ '.join(q_list) if q_list else "Empty"
-            html = f"""
-            <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; margin-bottom: 10px;">
-                <strong>Ready Queue (Approximate):</strong> <span style="color: #007bff;">{q_str}</span>
-            </div>
-            """
-            queue_placeholder.markdown(html, unsafe_allow_html=True)
+            
+            # Check if an MLF/Q algorithm was run
+            is_mlfq = (st.session_state.last_run_df is not None) and ("current_queue" in st.session_state.last_run_df.columns)
+            
+            if is_mlfq:
+                # Filter waiting tasks by queue
+                # Use pd.isnull(df['ct']) | (df['ct'] > t) to handle preemption/in-progress tasks
+                waiting_procs = df[(df['at'] <= t) & (df['ct'].isnull() | (df['ct'] > t)) & (df['pid'] != curr_task)]
+                
+                q1 = waiting_procs[waiting_procs['current_queue'] == 1]['pid'].tolist()
+                q2 = waiting_procs[waiting_procs['current_queue'] == 2]['pid'].tolist()
+                q3 = waiting_procs[waiting_procs['current_queue'] == 3]['pid'].tolist()
+                
+                title = "Multi-Level Queues"
+                
+                q_html = f"""
+                <div style="margin-bottom: 5px;"><strong>Q1 (Highest Priority):</strong> <span style="color: #FF6B6B;">{' ➡️ '.join(q1) if q1 else 'Empty'}</span></div>
+                <div style="margin-bottom: 5px;"><strong>Q2 (Medium Priority):</strong> <span style="color: #4ECDC4;">{' ➡️ '.join(q2) if q2 else 'Empty'}</span></div>
+                <div style="margin-bottom: 5px;"><strong>Q3 (Lowest Priority):</strong> <span style="color: #45B7D1;">{' ➡️ '.join(q3) if q3 else 'Empty'}</span></div>
+                """
+                queue_placeholder.markdown(f"""
+                <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; margin-bottom: 10px;">
+                    <strong>{title}:</strong>
+                    {q_html}
+                </div>
+                """, unsafe_allow_html=True)
+
+            else:
+                # Standard Queue visualization
+                q_list = [p['pid'] for i,p in df.iterrows() if p['at']<=t and (pd.isnull(p['ct']) or p['ct']>t) and p['pid']!=curr_task]
+                q_str = ' ➡️ '.join(q_list) if q_list else "Empty"
+                html = f"""
+                <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; margin-bottom: 10px;">
+                    <strong>Ready Queue (Approximate):</strong> <span style="color: #007bff;">{q_str}</span>
+                </div>
+                """
+                queue_placeholder.markdown(html, unsafe_allow_html=True)
+
 
         # Logic A/B/C Combined View
         if st.session_state.last_run_df is not None:
@@ -369,18 +438,36 @@ with tab2:
     else:
         ca1, ca2 = st.columns(2)
         with ca1:
-            algoA = st.selectbox("Algorithm A", ["FCFS", "Round Robin", "SJF (Non-Preemptive)", "SRTF (Preemptive SJF)", "Priority (Non-Preemptive)", "Priority (Preemptive)"], index=0)
-            qA = 2; 
+            algoA = st.selectbox("Algorithm A", [
+                "FCFS", "Round Robin", "SJF (Non-Preemptive)", "SRTF (Preemptive SJF)", 
+                "Priority (Non-Preemptive)", "Priority (Preemptive)", "MLFQ (Multi-Level Feedback Queue)", "MLQ (Multi-Level Queue)"
+            ], index=0)
+            qA = 2; mlq_assigns_A = {}
             if algoA == "Round Robin": qA = st.number_input("Q-A", 1, 10, 2, key="qA")
+            elif algoA in ["MLFQ (Multi-Level Feedback Queue)", "MLQ (Multi-Level Queue)"]: 
+                qA = 0
+                if algoA == "MLQ (Multi-Level Queue)":
+                     st.warning("MLQ assignments for Algo A must be set in the Simulation tab.")
+                     mlq_assigns_A = mlq_assignments # Use assignments from Tab 1
+            
         with ca2:
-            algoB = st.selectbox("Algorithm B", ["FCFS", "Round Robin", "SJF (Non-Preemptive)", "SRTF (Preemptive SJF)", "Priority (Non-Preemptive)", "Priority (Preemptive)"], index=1)
-            qB = 2; 
+            algoB = st.selectbox("Algorithm B", [
+                "FCFS", "Round Robin", "SJF (Non-Preemptive)", "SRTF (Preemptive SJF)", 
+                "Priority (Non-Preemptive)", "Priority (Preemptive)", "MLFQ (Multi-Level Feedback Queue)", "MLQ (Multi-Level Queue)"
+            ], index=1)
+            qB = 2; mlq_assigns_B = {}
             if algoB == "Round Robin": qB = st.number_input("Q-B", 1, 10, 2, key="qB")
+            elif algoB in ["MLFQ (Multi-Level Feedback Queue)", "MLQ (Multi-Level Queue)"]: 
+                qB = 0
+                if algoB == "MLQ (Multi-Level Queue)":
+                     st.warning("MLQ assignments for Algo B must be set in the Simulation tab.")
+                     mlq_assigns_B = mlq_assignments # Use assignments from Tab 1
 
         if st.button("Compare Algorithms"):
             try:
-                df1, tl1 = solve_scheduling(st.session_state.processes, algoA, qA)
-                df2, tl2 = solve_scheduling(st.session_state.processes, algoB, qB)
+                # NOTE: We reuse mlq_assignments from Tab 1 for comparison runs
+                df1, tl1 = solve_scheduling(st.session_state.processes, algoA, qA, mlq_assigns_A)
+                df2, tl2 = solve_scheduling(st.session_state.processes, algoB, qB, mlq_assigns_B)
             except SchedulerLoadError as e:
                 st.error(str(e))
                 st.stop()

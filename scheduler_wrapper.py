@@ -1,32 +1,7 @@
 import ctypes
 import pandas as pd
 import os
-import streamlit as st # Keep this for the error handler, but define the exception correctly
-
-# 1. Define C Structures
-class Process(ctypes.Structure):
-    _fields_ = [
-        ("pid", ctypes.c_int),
-        ("at", ctypes.c_int),
-        ("bt", ctypes.c_int),
-        ("priority", ctypes.c_int),      # Base priority from input
-        ("ct", ctypes.c_int),
-        ("tat", ctypes.c_int),
-        ("wt", ctypes.c_int),
-        ("rem_time", ctypes.c_int),
-        
-        # --- NEW FIELDS FOR AGING/RT ---
-        ("first_run", ctypes.c_int),     # Time when the process first ran
-        ("base_priority", ctypes.c_int), # Original priority (used for comparison)
-        ("current_priority", ctypes.c_int), # Aged priority
-    ]
-
-class GanttLog(ctypes.Structure):
-    _fields_ = [
-        ("pid", ctypes.c_int),
-        ("start", ctypes.c_int),
-        ("finish", ctypes.c_int),
-    ]
+import streamlit as st # Retained for exception definition, must not be used directly
 
 # --- Error Handling Setup ---
 class SchedulerLoadError(Exception):
@@ -36,6 +11,31 @@ class SchedulerLoadError(Exception):
 def run_scheduler_dummy(procs, n, algorithm_code, quantum, logs, max_logs):
     """Dummy function to raise a clear error if the DLL is not loaded."""
     raise SchedulerLoadError("The C++ scheduler.dll could not be loaded. Please ensure the file is in the project directory and compiled correctly.")
+
+# 1. Define C Structures
+class Process(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_int),
+        ("at", ctypes.c_int),
+        ("bt", ctypes.c_int),
+        ("priority", ctypes.c_int),      
+        ("ct", ctypes.c_int),
+        ("tat", ctypes.c_int),
+        ("wt", ctypes.c_int),
+        ("rem_time", ctypes.c_int),
+        ("first_run", ctypes.c_int),     
+        ("base_priority", ctypes.c_int), 
+        ("current_priority", ctypes.c_int),
+        ("current_queue", ctypes.c_int), 
+        ("last_q3_entry", ctypes.c_int),
+    ]
+
+class GanttLog(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_int),
+        ("start", ctypes.c_int),
+        ("finish", ctypes.c_int),
+    ]
 
 # 2. Load Library
 dll_path = os.path.abspath("scheduler.dll")
@@ -59,8 +59,8 @@ if dll_loaded:
     lib.run_scheduler.restype = ctypes.c_int
 
 
-def solve_scheduling(processes, algorithm_name, quantum=2):
-    n = len(processes)
+def solve_scheduling(processes_input, algorithm_name, quantum=2, mlq_assignments=None):
+    n = len(processes_input)
 
     if n == 0:
         return pd.DataFrame(), []
@@ -68,6 +68,28 @@ def solve_scheduling(processes, algorithm_name, quantum=2):
     ProcessArray = Process * n
     c_procs = ProcessArray()
     
+    # 0: FCFS, 1: SJF, 2: SRTF, 3: Prio-NP, 4: Prio-P, 5: RR, 6: MLFQ, 7: MLQ
+    algo_map = {
+        "FCFS": 0, "SJF (Non-Preemptive)": 1, "SRTF (Preemptive SJF)": 2, 
+        "Priority (Non-Preemptive)": 3, "Priority (Preemptive)": 4, 
+        "Round Robin": 5, "MLFQ (Multi-Level Feedback Queue)": 6,
+        "MLQ (Multi-Level Queue)": 7 
+    }
+    algo_code = algo_map.get(algorithm_name, 0)
+    
+    processes = processes_input
+    
+    # --- MLQ Assignment Logic ---
+    if algo_code == 7 and mlq_assignments:
+        processes = []
+        for p in processes_input:
+            p_new = p.copy()
+            # Assign the target queue ID (1, 2, or 3) from the Streamlit input
+            # If the process isn't in mlq_assignments (shouldn't happen), default to Q3
+            p_new['queue_assignment'] = mlq_assignments.get(p['pid'], 3) 
+            processes.append(p_new)
+
+    # Convert Python dicts to C structs
     for i, p in enumerate(processes):
         try:
             pid_num = int(str(p['pid']).replace('P', ''))
@@ -77,20 +99,24 @@ def solve_scheduling(processes, algorithm_name, quantum=2):
         c_procs[i].pid = pid_num
         c_procs[i].at = int(p['at'])
         c_procs[i].bt = int(p['bt'])
-        c_procs[i].priority = int(p['priority'])
         c_procs[i].rem_time = int(p['bt'])
-        # Initialize new fields (important for the C++ side to read zeros/defaults)
+        
+        # Priority mapping: 
+        if algo_code == 7:
+            # For MLQ, we store the assigned Queue ID in the priority field for C++ initialization.
+            c_procs[i].priority = int(p['queue_assignment'])
+            c_procs[i].base_priority = int(p['priority']) # Store original priority separately
+        else:
+            # Standard priority scheduling
+            c_procs[i].priority = int(p['priority'])
+            c_procs[i].base_priority = int(p['priority'])
+            
+        
+        # Initialize extended fields
+        c_procs[i].current_priority = int(p['priority']) # Initial current priority
         c_procs[i].first_run = -1 
-        c_procs[i].base_priority = int(p['priority'])
-        c_procs[i].current_priority = int(p['priority'])
-
-
-    # Map Algorithm Name to Code
-    algo_map = {
-        "FCFS": 0, "SJF (Non-Preemptive)": 1, "SRTF (Preemptive SJF)": 2, 
-        "Priority (Non-Preemptive)": 3, "Priority (Preemptive)": 4, "Round Robin": 5
-    }
-    algo_code = algo_map.get(algorithm_name, 0)
+        c_procs[i].current_queue = -1
+        c_procs[i].last_q3_entry = -1
 
     max_logs = 1000
     LogArray = GanttLog * max_logs
@@ -104,24 +130,31 @@ def solve_scheduling(processes, algorithm_name, quantum=2):
     final_data = []
     for i in range(n):
         p = c_procs[i]
-        
-        # Calculate Response Time (RT)
         rt = p.first_run - p.at if p.first_run != -1 else 0
         
-        final_data.append({
+        final_pid_data = {
             "pid": f"P{p.pid}",
             "at": p.at,
             "bt": p.bt,
-            "priority": p.priority,
             "ct": p.ct,
             "tat": p.tat,
             "wt": p.wt,
-            "rt": rt,         # NEW METRIC
+            "rt": rt,
+            "current_queue": p.current_queue,
             "status": "completed"
-        })
+        }
+        
+        if algo_code == 7:
+             # For MLQ, show the assigned queue as the priority for clarity
+             final_pid_data['priority'] = p.current_queue 
+        else:
+             final_pid_data['priority'] = p.base_priority
+             
+        final_data.append(final_pid_data)
+        
     final_df = pd.DataFrame(final_data)
 
-    # 2. Timeline (remains the same)
+    # 2. Timeline
     timeline = []
     for i in range(count):
         l = c_logs[i]

@@ -5,7 +5,8 @@ import plotly.express as px
 import time
 import io
 import random
-from scheduler_wrapper import solve_scheduling
+# --- NEW IMPORT ---
+from scheduler_wrapper import solve_scheduling, SchedulerLoadError
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Hybrid OS Scheduler Pro", page_icon="🚀", layout="wide")
@@ -15,7 +16,7 @@ st.markdown("""
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
+    
     .block-container {padding-top: 1rem; padding-bottom: 3rem;}
     
     /* Metrics Styling */
@@ -126,7 +127,13 @@ def run_scheduler_logic(algo, quant):
         st.error("Please add processes first.")
         return False
     
-    final_df, timeline = solve_scheduling(st.session_state.processes, algo, quant)
+    try:
+        # --- Catch the DLL loading error here ---
+        final_df, timeline = solve_scheduling(st.session_state.processes, algo, quant)
+    except SchedulerLoadError as e:
+        st.error(str(e)) # Display the specific DLL error to the user
+        return False
+        
     total_time = int(final_df['ct'].max()) if not final_df.empty else 0
     
     st.session_state.last_run_df = final_df
@@ -147,7 +154,7 @@ with st.sidebar.form("add_manual"):
     prio = c2.number_input("Priority", 1, value=1)
     if st.form_submit_button("Add Process"):
         st.session_state.processes.append({"pid": pid, "at": int(at), "bt": int(bt), "priority": int(prio)})
-        st.rerun() # <-- CHANGE 1: Use st.rerun()
+        st.rerun() # Use st.rerun()
 
 # --- Process Generation Tab 2 ---
 st.sidebar.subheader("🎲 Random Process Generator")
@@ -161,25 +168,34 @@ with st.sidebar.form("add_random"):
     if st.form_submit_button(f"Generate {N} Processes"):
         new_procs = generate_random_processes(N, max_at, min_bt, max_bt, max_prio)
         st.session_state.processes.extend(new_procs)
-        st.rerun() # <-- CHANGE 2: Use st.rerun()
+        st.rerun() # Use st.rerun()
 
 # --- Process File Handling ---
 st.sidebar.subheader("📂 Data Utilities")
-upload_file = st.sidebar.file_uploader("Upload CSV Process List", type=["csv"])
+upload_file = st.sidebar.file_uploader("Upload CSV Process List", type=["csv"], key="csv_uploader")
+
 if upload_file is not None:
+    # We process the upload ONLY if the file handle itself is present AND if we haven't processed it this run
     try:
         uploaded_df = pd.read_csv(upload_file)
         # Ensure column names match expected keys
         required_cols = ['pid', 'at', 'bt', 'priority']
         if all(col in uploaded_df.columns for col in required_cols):
             st.session_state.processes = uploaded_df[required_cols].astype({'at': int, 'bt': int, 'priority': int}).to_dict('records')
-            st.sidebar.success("Processes loaded successfully!")
-            st.rerun() # <-- Added rerun after successful load
+            
+            # The page will rerun automatically because the session state changed,
+            # but we avoid an explicit st.rerun() which can loop with uploaders.
+            st.sidebar.success("Processes loaded successfully! The page will refresh shortly.")
+            
+            # Note: Because we removed st.rerun(), the file handle persists across script reruns.
+            # However, since we rely on the implicit Streamlit flow, this should prevent the lockup.
+            # If the lockup persists, you might need to try wrapping this entire section in st.sidebar.form()
+            # to clear the upload state on form submission, but let's try this first.
+
         else:
             st.sidebar.error(f"CSV must contain columns: {', '.join(required_cols)}")
     except Exception as e:
         st.sidebar.error(f"Error reading file: {e}")
-
 # Download button for current processes
 if st.session_state.processes:
     download_df = pd.DataFrame(st.session_state.processes)
@@ -197,7 +213,7 @@ if st.sidebar.button("Reset All Data", help="Clears all processes and simulation
     st.session_state.processes = []
     st.session_state.last_run_df = None
     st.session_state.step_mode_active = False
-    st.rerun() # <-- CHANGE 3: Use st.rerun()
+    st.rerun() # Use st.rerun()
 
 # --- MAIN APP ---
 st.title("⚡ Hybrid OS Scheduler Pro")
@@ -219,7 +235,6 @@ tab1, tab2, tab3 = st.tabs(["⚡ Real-Time Simulation", "⚔️ Algorithm Compar
 
 # === TAB 1: SIMULATION ===
 with tab1:
-    # ... (Simulation logic remains the same, leveraging the enhanced helper functions)
     col_settings, col_visuals = st.columns([1, 3.5], gap="medium")
 
     # --- SETTINGS ---
@@ -258,7 +273,6 @@ with tab1:
         stats_placeholder = st.empty()
 
         def render_queue(t, df, curr_task):
-            # NOTE: Getting the exact ready queue state dynamically in Python is complex without re-running the C++ logic.
             # We approximate the queue by checking which processes have arrived, are not complete, and are not currently running.
             q_list = [p['pid'] for i,p in df.iterrows() if p['at']<=t and p['ct']>t and p['pid']!=curr_task]
             q_str = ' ➡️ '.join(q_list) if q_list else "Empty"
@@ -275,16 +289,15 @@ with tab1:
             timeline = st.session_state.last_run_tl
             total_time = st.session_state.last_total_time
             
-            if anim_clicked or (st.session_state.step_mode_active and st.session_state.current_step_time <= total_time):
+            # Check if simulation is active (animation or mid-step)
+            is_active = anim_clicked or (st.session_state.step_mode_active and st.session_state.current_step_time <= total_time)
+            
+            if is_active:
                 
-                start_t = 0
-                end_t = total_time + 1
                 current_t = st.session_state.current_step_time
+                if anim_clicked: current_t = 0
                 
-                if anim_clicked:
-                    current_t = 0
-                
-                t_range = [current_t] if st.session_state.step_mode_active else range(current_t, end_t)
+                t_range = [current_t] if st.session_state.step_mode_active else range(current_t, total_time + 1)
 
                 for t in t_range:
                     # 1. Update Metrics
@@ -318,11 +331,11 @@ with tab1:
                     if bc1.button("◀ Previous Step"):
                         if st.session_state.current_step_time > 0:
                             st.session_state.current_step_time -= 1
-                            st.rerun() # <-- CHANGE 4: Use st.rerun()
+                            st.rerun() # Use st.rerun()
                     if bc2.button("Next Step ▶"):
                         if st.session_state.current_step_time < total_time:
                             st.session_state.current_step_time += 1
-                            st.rerun() # <-- CHANGE 5: Use st.rerun()
+                            st.rerun() # Use st.rerun()
 
                 # Display final stats if simulation is complete
                 if st.session_state.current_step_time >= total_time or anim_clicked:
@@ -357,8 +370,14 @@ with tab2:
             if algoB == "Round Robin": qB = st.number_input("Q-B", 1, 10, 2, key="qB")
 
         if st.button("Compare Algorithms"):
-            df1, tl1 = solve_scheduling(st.session_state.processes, algoA, qA)
-            df2, tl2 = solve_scheduling(st.session_state.processes, algoB, qB)
+            try:
+                df1, tl1 = solve_scheduling(st.session_state.processes, algoA, qA)
+                df2, tl2 = solve_scheduling(st.session_state.processes, algoB, qB)
+            except SchedulerLoadError as e:
+                st.error(str(e))
+                # Skip visualization if DLL failed
+                st.stop()
+
             max_t = max(df1['ct'].max(), df2['ct'].max())
             
             st.markdown("### 📈 Performance Summary")

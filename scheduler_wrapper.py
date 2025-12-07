@@ -23,11 +23,13 @@ class GanttLog(ctypes.Structure):
     ]
 
 # --- Error Handling Setup ---
+class SchedulerLoadError(Exception):
+    """Custom exception raised when the DLL fails to load."""
+    pass
+
 def run_scheduler_dummy(procs, n, algorithm_code, quantum, logs, max_logs):
-    """Dummy function to prevent crash if DLL is not loaded."""
-    # Raise a clear error when trying to use the dummy function
-    raise RuntimeError("The C++ scheduler.dll could not be loaded. Please ensure the file is in the project directory and compiled correctly.")
-    # return 0
+    """Dummy function to raise a clear error if the DLL is not loaded."""
+    raise SchedulerLoadError("The C++ scheduler.dll could not be loaded. Please ensure the file is in the project directory and compiled correctly.")
 
 # 2. Load Library
 dll_path = os.path.abspath("scheduler.dll")
@@ -62,21 +64,12 @@ if dll_loaded:
 def solve_scheduling(processes, algorithm_name, quantum=2):
     n = len(processes)
 
-    # If DLL failed to load, calling lib.run_scheduler will call run_scheduler_dummy 
-    # and raise the descriptive runtime error.
-    if not dll_loaded and n > 0:
-         # We still need to run the dummy function if the DLL is missing, 
-         # but since it raises an exception, we wrap it in a try/except for a nicer Streamlit message
-         try:
-             lib.run_scheduler(None, 0, 0, 0, None, 0)
-         except RuntimeError as e:
-             st.error(str(e))
-             return pd.DataFrame(), [] # Return empty dataframes
-         
-    # Only proceed if there are processes to run OR if the DLL is loaded (safe call)
     if n == 0:
         return pd.DataFrame(), []
-
+    
+    # Check if the dummy function is installed (meaning DLL failed to load)
+    # We call run_scheduler immediately. If it's the dummy, it raises SchedulerLoadError.
+    
     ProcessArray = Process * n
     c_procs = ProcessArray()
     
@@ -111,6 +104,7 @@ def solve_scheduling(processes, algorithm_name, quantum=2):
     c_logs = LogArray()
 
     # --- CALL C++ ---
+    # If lib.run_scheduler is the dummy, this line will raise SchedulerLoadError
     count = lib.run_scheduler(c_procs, n, algo_code, int(quantum), c_logs, max_logs)
 
     # --- Convert Results back to Python format ---
